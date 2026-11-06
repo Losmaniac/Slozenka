@@ -57,6 +57,11 @@
     <button id="share" class="btn primary" type="button">Sdílet QR kód</button>
     <div id="sharehint" class="hint">Podrž QR kód a zvol Sdílet nebo Uložit do Fotek. V bankovní aplikaci pak zvol platbu z QR kódu z galerie, nebo QR naskenuj z jiného zařízení.</div>
   </div>
+  <div class="card">
+    <label class="f">Klíč OpenRouter (volitelné: čtení fotky přes AI zdarma)
+      <input id="orkey" type="password" autocomplete="off" autocapitalize="off" placeholder="sk-or-…"></label>
+    <div class="hint">Klíč zdarma získáš na openrouter.ai/keys. Ukládá se jen v tomto telefonu. S klíčem se fotka odešle na OpenRouter a bezplatným modelům, jejich poskytovatelé ji mohou ukládat. Bez klíče se text čte přímo v telefonu.</div>
+  </div>
 </main>
 
 <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
@@ -162,6 +167,53 @@ async function ocr(img) {
   return (await worker.recognize(toCanvas(img, 2200))).data.text;
 }
 
+// ---------- čtení přes bezplatné modely OpenRouter ----------
+const PROMPT = 'Na fotce je česká složenka nebo platební příkaz. Najdi údaje pro zaplacení: číslo účtu PŘÍJEMCE (ne plátce), částku a symboly. Odpověz jen JSON objektem {"acc":"[předčíslí-]číslo/kód banky","am":"částka jako číslo, např. 1234.50","vs":"","ss":"","ks":""}. Co na fotce není, dej jako prázdný řetězec. Číslice opisuj přesně a nic nehádej.';
+async function aiFetch(url, opt, ms = 30000) {
+  const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), ms);
+  try { return await fetch(url, { ...opt, signal: ctl.signal }); } finally { clearTimeout(t); }
+}
+async function readWithAI(img, key) {
+  // Seznam bezplatných modelů s podporou obrázků se mění, proto se načítá za běhu.
+  const list = (await (await aiFetch('https://openrouter.ai/api/v1/models', {}, 15000)).json()).data
+    .filter(m => m.id.endsWith(':free') && (m.architecture?.input_modalities || []).includes('image'))
+    .map(m => m.id).sort((a, b) => /gemma/.test(b) - /gemma/.test(a)).slice(0, 3);
+  if (!list.length) throw new Error('žádný bezplatný model');
+  const image = toCanvas(img, 1600).toDataURL('image/jpeg', 0.85);
+  let last = 'chyba';
+  for (const model of list) {
+    try {
+      const r = await aiFetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model, temperature: 0, messages: [{ role: 'user', content: [
+          { type: 'text', text: PROMPT }, { type: 'image_url', image_url: { url: image } }] }] }),
+      });
+      if (r.status === 401) throw new Error('neplatný klíč');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const txt = (await r.json()).choices?.[0]?.message?.content || '';
+      const o = JSON.parse(txt.slice(txt.indexOf('{'), txt.lastIndexOf('}') + 1));
+      const t = k => String(o[k] ?? '').trim();
+      return { acc: t('acc'), am: t('am').replace('.', ','), vs: t('vs'), ss: t('ss'), ks: t('ks') };
+    } catch (e) {
+      last = e.message;
+      if (last === 'neplatný klíč') break;
+    }
+  }
+  throw new Error(last);
+}
+async function readFields(img) {
+  const key = $('orkey').value.trim();
+  if (key) {
+    $('msg').textContent = 'AI čte složenku…';
+    try { return await readWithAI(img, key); }
+    catch (e) { $('msg').textContent = 'AI nešla (' + e.message + '), čtu text v telefonu…'; }
+  } else $('msg').textContent = 'Čtu text…';
+  return parseText(await ocr(img));
+}
+try { $('orkey').value = localStorage.getItem('orkey') || ''; } catch {}
+$('orkey').onchange = () => { try { localStorage.setItem('orkey', $('orkey').value.trim()); } catch {} };
+
 // ---------- formulář + QR ----------
 const ids = ['acc', 'am', 'vs', 'ss', 'ks', 'msgtxt'];
 const num = s => { const x = parseFloat(s.replace(/\s/g, '').replace(',', '.')); return isFinite(x) && x > 0 ? x : 0; };
@@ -207,8 +259,7 @@ $('file').onchange = async e => {
       fill({ acc: fromIban(spd.ACC.split('+')[0]), am: spd.AM ? spd.AM.replace('.', ',') : '', vs: spd['X-VS'] || '', ss: spd['X-SS'] || '', ks: spd['X-KS'] || '', msgtxt: spd.MSG || '' });
       msg.textContent = 'Na složence byl QR kód, údaje z něj jsou ve formuláři.';
     } else {
-      msg.textContent = 'Čtu text…';
-      const p = parseText(await ocr(img));
+      const p = await readFields(img);
       fill(p);
       const missing = ['acc', 'am'].filter(k => !p[k]);
       msg.className = missing.length ? 'warn' : 'hint';
