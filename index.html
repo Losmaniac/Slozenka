@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Složenka">
+<meta name="theme-color" content="#1c7c86">
+<title>Složenka → QR platba</title>
+<style>
+  :root { --ink:#14232b; --soft:#4c6067; --paper:#f4f8f7; --panel:#fff; --line:#d7e1df; --accent:#1c7c86; --bad:#a40000; --warn:#9a5b00; color-scheme:light dark; }
+  @media (prefers-color-scheme: dark) {
+    :root { --ink:#eef4f3; --soft:#9fb3b3; --paper:#0e1a1d; --panel:#152325; --line:#253537; --accent:#56b6bf; --bad:#ff8a8a; --warn:#f0b35a; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:max(16px,env(safe-area-inset-top)) 16px max(16px,env(safe-area-inset-bottom)); background:var(--paper); color:var(--ink); font:16px/1.4 system-ui,-apple-system,sans-serif; }
+  main { max-width:480px; margin:0 auto; display:grid; gap:12px; }
+  h1 { font-size:20px; margin:0; }
+  .card { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:14px; display:grid; gap:10px; }
+  .btn { display:block; width:100%; padding:14px; border-radius:12px; border:1px solid var(--line); background:var(--panel); color:var(--ink); font:inherit; text-align:center; }
+  .primary { background:var(--accent); color:#fff; border-color:var(--accent); font-weight:600; }
+  label.f { display:grid; gap:4px; font-size:14px; color:var(--soft); }
+  input[type=text] { width:100%; padding:12px; border-radius:10px; border:1px solid var(--line); background:var(--paper); color:var(--ink); font:16px system-ui; }
+  .two { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+  .err { color:var(--bad); } .warn { color:var(--warn); } .hint { color:var(--soft); font-size:14px; }
+  #qr { width:100%; max-width:320px; margin:0 auto; image-rendering:pixelated; background:#fff; border-radius:8px; -webkit-touch-callout:default; -webkit-user-select:auto; user-select:auto; }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Složenka → QR platba</h1>
+
+  <label class="btn primary">
+    📷 Vyfotit složenku
+    <input id="file" type="file" accept="image/*" capture="environment" hidden>
+  </label>
+  <div id="msg" class="hint">Vyfoť celou složenku. Údaje se přečtou z textu, pak je zkontroluj a oprav.</div>
+
+  <form id="form" class="card" autocomplete="off">
+    <label class="f">Číslo účtu (např. 19-2000145399/0800)
+      <input id="acc" type="text" inputmode="text" autocapitalize="off" autocorrect="off"></label>
+    <div class="two">
+      <label class="f">Částka (Kč)<input id="am" type="text" inputmode="decimal"></label>
+      <label class="f">Variabilní symbol<input id="vs" type="text" inputmode="numeric"></label>
+    </div>
+    <div class="two">
+      <label class="f">Specifický symbol<input id="ss" type="text" inputmode="numeric"></label>
+      <label class="f">Konstantní symbol<input id="ks" type="text" inputmode="numeric"></label>
+    </div>
+    <label class="f">Zpráva pro příjemce<input id="msgtxt" type="text" maxlength="60"></label>
+    <div id="check" class="hint"></div>
+  </form>
+
+  <div id="out" class="card" hidden>
+    <img id="qr" alt="QR Platba">
+    <button id="share" class="btn primary" type="button">Sdílet QR kód</button>
+    <div id="sharehint" class="hint">Podrž QR kód a zvol Sdílet nebo Uložit do Fotek. V bankovní aplikaci pak zvol platbu z QR kódu z galerie, nebo QR naskenuj z jiného zařízení.</div>
+  </div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+
+// ---------- účet ↔ IBAN ----------
+// Kontrolní součet českého čísla účtu (a předčíslí): váhy 1,2,4,8,5,10,9,7,3,6 zprava, součet mod 11 = 0.
+const W = [6, 3, 7, 9, 10, 5, 8, 4, 2, 1];
+function accOk(s) {
+  const d = s.padStart(10, '0');
+  return d.split('').reduce((a, c, i) => a + +c * W[i], 0) % 11 === 0;
+}
+function parseAcc(t) {
+  const m = t.replace(/\s/g, '').match(/^(?:(\d{1,6})-)?(\d{2,10})\/(\d{4})$/);
+  return m && { prefix: m[1] || '', num: m[2], bank: m[3] };
+}
+function toIban({ prefix, num, bank }) {
+  const bban = bank + prefix.padStart(6, '0') + num.padStart(10, '0');
+  const k = String(98n - BigInt(bban + '123500') % 97n).padStart(2, '0');
+  return 'CZ' + k + bban;
+}
+function fromIban(iban) {
+  const m = iban.match(/^CZ\d{2}(\d{4})(\d{6})(\d{10})$/);
+  if (!m) return '';
+  const z = s => s.replace(/^0+/, '');
+  return (z(m[2]) ? z(m[2]) + '-' : '') + z(m[3]) + '/' + m[1];
+}
+
+// ---------- SPD ----------
+function parseSPD(text) {
+  if (!/^SPD\*1\.0\*/.test(text)) return null;
+  const f = {};
+  for (const part of text.split('*').slice(2)) {
+    const i = part.indexOf(':');
+    if (i < 1) continue;
+    let v = part.slice(i + 1);
+    try { v = decodeURIComponent(v); } catch {}
+    f[part.slice(0, i).toUpperCase()] = v;
+  }
+  return f.ACC ? f : null;
+}
+const clean = s => s.normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[*\n\r]/g, ' ').trim().slice(0, 60);
+function buildSPD(v) {
+  const a = parseAcc(v.acc);
+  let s = 'SPD*1.0*ACC:' + toIban(a);
+  if (v.am) s += '*AM:' + v.am.toFixed(2);
+  s += '*CC:CZK';
+  if (v.vs) s += '*X-VS:' + v.vs;
+  if (v.ss) s += '*X-SS:' + v.ss;
+  if (v.ks) s += '*X-KS:' + v.ks;
+  if (v.msg) s += '*MSG:' + clean(v.msg);
+  return s;
+}
+
+// ---------- OCR → pole ----------
+function parseAmount(t) {
+  const n = String.raw`(\d[\d  .]*(?:[,.]\d{1,2})?)`;
+  const m = t.match(new RegExp('(?:částka|celkem|k úhradě|platit)[^\\d\\n]{0,25}' + n, 'i'))
+         || t.match(new RegExp(n + '\\s*(?:Kč|CZK|,-)', 'i'));
+  if (!m) return '';
+  let x = m[1].replace(/[  ]/g, '');
+  const d = x.match(/[,.](\d{1,2})$/);
+  const dec = d ? d[1] : '';
+  const int = (d ? x.slice(0, d.index) : x).replace(/[.,]/g, '');
+  return int + (dec ? ',' + dec : '');
+}
+const sym = (t, re) => (t.match(re) || [])[1] || '';
+function parseText(t) {
+  const a = t.match(/(?:(\d{1,6})\s*-\s*)?(\d{2,10})\s*\/\s*(\d{4})/);
+  return {
+    acc: a ? (a[1] ? a[1] + '-' : '') + a[2] + '/' + a[3] : '',
+    am: parseAmount(t),
+    vs: sym(t, /(?:variabiln\S*(?:\s*symbol)?|\bVS)\W{0,6}(\d{1,10})/i),
+    ss: sym(t, /(?:specifick\S*(?:\s*symbol)?|\bSS)\W{0,6}(\d{1,10})/i),
+    ks: sym(t, /(?:konstantn\S*(?:\s*symbol)?|\bKS)\W{0,6}(\d{1,4})/i),
+  };
+}
+
+// ---------- obrázek ----------
+function toCanvas(img, max) {
+  const k = Math.min(1, max / Math.max(img.width, img.height));
+  const c = document.createElement('canvas');
+  c.width = Math.round(img.width * k); c.height = Math.round(img.height * k);
+  c.getContext('2d', { willReadFrequently: true }).drawImage(img, 0, 0, c.width, c.height);
+  return c;
+}
+function findQR(img) {
+  for (const max of [2400, 1600, 1000]) { // drobný QR se při zmenšení ztratí, proto víc velikostí
+    const c = toCanvas(img, max), d = c.getContext('2d').getImageData(0, 0, c.width, c.height);
+    const code = jsQR(d.data, d.width, d.height);
+    if (code) return code.data;
+  }
+  return null;
+}
+let worker;
+async function ocr(img) {
+  worker ||= await Tesseract.createWorker('ces', 1, {
+    logger: m => { if (m.status === 'recognizing text') $('msg').textContent = 'Čtu text… ' + Math.round(m.progress * 100) + ' %'; },
+  });
+  return (await worker.recognize(toCanvas(img, 2200))).data.text;
+}
+
+// ---------- formulář + QR ----------
+const ids = ['acc', 'am', 'vs', 'ss', 'ks', 'msgtxt'];
+const num = s => { const x = parseFloat(s.replace(/\s/g, '').replace(',', '.')); return isFinite(x) && x > 0 ? x : 0; };
+function fill(o) { for (const k of ids) if (o[k] !== undefined) $(k).value = o[k]; refresh(); }
+
+let qrBlob;
+function refresh() {
+  const check = $('check'), out = $('out');
+  out.hidden = true; check.className = 'hint';
+  const acc = parseAcc($('acc').value);
+  if (!acc) { check.textContent = $('acc').value ? 'Číslo účtu musí mít tvar [předčíslí-]číslo/kód banky.' : ''; return; }
+  const bad = [acc.prefix && !accOk(acc.prefix) && 'předčíslí', !accOk(acc.num) && 'číslo účtu'].filter(Boolean);
+  if (bad.length) { check.className = 'warn'; check.textContent = 'Kontrolní součet nesedí (' + bad.join(', ') + '). Pravděpodobně chyba při čtení, zkontroluj číslice.'; }
+  else check.textContent = 'Číslo účtu je v pořádku.';
+  const v = { acc: $('acc').value, am: num($('am').value), vs: $('vs').value.replace(/\D/g, ''), ss: $('ss').value.replace(/\D/g, ''), ks: $('ks').value.replace(/\D/g, ''), msg: $('msgtxt').value };
+  const q = qrcode(0, 'M'); q.addData(buildSPD(v)); q.make();
+  const n = q.getModuleCount(), px = 8, b = 4, c = document.createElement('canvas');
+  c.width = c.height = (n + 2 * b) * px;
+  const g = c.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height); g.fillStyle = '#000';
+  for (let r = 0; r < n; r++) for (let k = 0; k < n; k++) if (q.isDark(r, k)) g.fillRect((k + b) * px, (r + b) * px, px, px);
+  $('qr').src = c.toDataURL(); c.toBlob(b => { qrBlob = b; }); out.hidden = false;
+}
+$('share').onclick = async () => {
+  if (!qrBlob) return;
+  const f = new File([qrBlob], 'qr-platba.png', { type: 'image/png' });
+  try {
+    if (!navigator.canShare?.({ files: [f] })) throw new Error('unsupported');
+    await navigator.share({ files: [f] });
+  } catch (e) {
+    if (e.name !== 'AbortError') { $('sharehint').className = 'warn'; $('sharehint').textContent = 'Tlačítko tu sdílet nemůže. Podrž prstem QR kód a zvol Sdílet nebo Uložit do Fotek.'; }
+  }
+};
+$('form').addEventListener('input', refresh);
+$('form').addEventListener('submit', e => e.preventDefault());
+
+$('file').onchange = async e => {
+  const file = e.target.files[0]; if (!file) return;
+  const msg = $('msg'); msg.className = 'hint'; msg.textContent = 'Zpracovávám fotku…';
+  try {
+    const img = await createImageBitmap(file, { imageOrientation: 'from-image' });
+    const spd = parseSPD(findQR(img) || '');
+    if (spd) {
+      fill({ acc: fromIban(spd.ACC.split('+')[0]), am: spd.AM ? spd.AM.replace('.', ',') : '', vs: spd['X-VS'] || '', ss: spd['X-SS'] || '', ks: spd['X-KS'] || '', msgtxt: spd.MSG || '' });
+      msg.textContent = 'Na složence byl QR kód, údaje z něj jsou ve formuláři.';
+    } else {
+      msg.textContent = 'Čtu text…';
+      const p = parseText(await ocr(img));
+      fill(p);
+      const missing = ['acc', 'am'].filter(k => !p[k]);
+      msg.className = missing.length ? 'warn' : 'hint';
+      msg.textContent = missing.length ? 'Něco se nepodařilo přečíst. Doplň prázdná pole ručně.' : 'Zkontroluj údaje s papírem, čtení textu se může splést.';
+    }
+  } catch (err) {
+    msg.className = 'err'; msg.textContent = 'Fotku se nepodařilo zpracovat: ' + err.message;
+  } finally { e.target.value = ''; }
+};
+
+// Rychlá kontrola logiky při otevření s #test (výsledek v konzoli).
+if (location.hash === '#test') {
+  console.assert(toIban(parseAcc('19-2000145399/0800')) === 'CZ6508000000192000145399', 'IBAN');
+  console.assert(fromIban('CZ6508000000192000145399') === '19-2000145399/0800', 'fromIban');
+  console.assert(accOk('2000145399') && accOk('19'), 'accOk');
+  console.assert(parseAmount('Částka: 1 234,50 Kč') === '1234,50', 'amount');
+}
+</script>
+</body>
+</html>
